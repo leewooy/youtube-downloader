@@ -77,6 +77,16 @@ const getBinaryPath = () => {
     return binPath;
 };
 
+// YouTube 서명 해독에 JS 런타임(deno)이 필요 — PATH에 없을 수 있어 홈 디렉터리 설치 경로를 명시
+const getJsRuntimeArgs = () => {
+    const denoName = process.platform === 'win32' ? 'deno.exe' : 'deno';
+    const denoPath = path.join(os.homedir(), '.deno', 'bin', denoName);
+    return fs.existsSync(denoPath)
+        ? ['--js-runtimes', `deno:${denoPath}`]
+        : ['--js-runtimes', 'deno'];
+};
+const JS_RUNTIME_ARGS = getJsRuntimeArgs();
+
 const execYtDlp = async (url, args = []) => {
     const binPath = getBinaryPath();
     console.log('Executing yt-dlp with binary path:', binPath);
@@ -86,10 +96,10 @@ const execYtDlp = async (url, args = []) => {
         const ytProcess = spawn(binPath || 'yt-dlp', [
             url,
             '--dump-single-json',
+            '--no-playlist',
             '--no-warnings',
-            '--no-call-home',
             '--prefer-free-formats',
-            '--youtube-skip-dash-manifest',
+            ...JS_RUNTIME_ARGS,
             ...args
         ]);
 
@@ -276,7 +286,9 @@ app.get('/download', async (req, res) => {
             url,
             '-f', `bestvideo[height=${heightValue}]+bestaudio/best[height<=${heightValue}]`,
             '-o', tempOutputPath, // 짧은 임시 파일명 사용
-            '--merge-output-format', 'mp4'
+            '--no-playlist',
+            '--merge-output-format', 'mp4',
+            ...JS_RUNTIME_ARGS
         ]);
 
         let totalFragments = null;
@@ -381,8 +393,10 @@ const execYtDlpAudio = async (url, outputPath, clientId) => {
             '-x',                      // 오디오 추출
             '--audio-format', 'mp3',   // MP3 형식
             '--audio-quality', '0',    // 최고 품질
+            '--no-playlist',           // 재생목록 무시, 단일 영상만
             '-o', outputPath,
-            '--progress'  // 진행 상황 출력 활성화
+            '--progress',  // 진행 상황 출력 활성화
+            ...JS_RUNTIME_ARGS
         ]);
 
         ytProcess.stdout.on('data', (data) => {
@@ -512,12 +526,14 @@ const execYtDlpSubtitle = async (url, outputPath, clientId) => {
         const ytProcess = spawn(binPath || 'yt-dlp', [
             url,
             '--skip-download',         // 비디오 다운로드 건너뛰기
+            '--no-playlist',           // 재생목록 무시, 단일 영상만
             '--write-auto-sub',        // 자동 생성 자막
             '--write-sub',             // 일반 자막
-            '--sub-lang', 'en.*',      // 영어 자막
+            '--sub-lang', 'en,en-US,en-GB',  // 영어 자막 (en.* 정규식은 en-orig 등 변형 전부와 매칭돼 429 발생)
             '--convert-subs', 'srt',   // SRT 형식으로 변환
             '-o', outputPath,
-            '--progress'
+            '--progress',
+            ...JS_RUNTIME_ARGS
         ]);
 
         ytProcess.stdout.on('data', (data) => {
@@ -546,18 +562,18 @@ const execYtDlpSubtitle = async (url, outputPath, clientId) => {
         });
 
         ytProcess.on('close', (code) => {
-            if (code === 0) {
-                if (clientId) {
-                    sendProgress(clientId, {
-                        type: 'subtitle',
-                        progress: 100,
-                        status: '다운로드 완료!'
-                    });
-                }
-                resolve();
-            } else {
-                reject(new Error('Subtitle download failed'));
+            // 일부 자막 트랙만 실패해도(예: 429) 나머지는 받아졌을 수 있으므로
+            // 종료 코드와 무관하게 resolve하고, 호출부에서 파일 존재 여부로 성공을 판단
+            if (code !== 0) {
+                console.error('yt-dlp subtitle process exited with code:', code);
+            } else if (clientId) {
+                sendProgress(clientId, {
+                    type: 'subtitle',
+                    progress: 100,
+                    status: '다운로드 완료!'
+                });
             }
+            resolve();
         });
     });
 };
@@ -585,8 +601,11 @@ app.get('/download-subtitle', async (req, res) => {
         // 자막 다운로드 실행
         await execYtDlpSubtitle(url, outputPath, clientId);
 
-        // 가능한 자막 파일명들 확인
+        // 가능한 자막 파일명들 확인 — 업로더가 올린 수동 자막(videoInfo.subtitles)을 우선
+        const manualSubLangs = Object.keys(videoInfo.subtitles || {})
+            .filter(lang => /^en([-_]|$)/i.test(lang));
         const possibleFiles = [
+            ...manualSubLangs.map(lang => `${outputPath}.${lang}.srt`),
             `${outputPath}.srt`,
             `${outputPath}.en.srt`,
             `${outputPath}.en-US.srt`,

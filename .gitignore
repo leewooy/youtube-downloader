@@ -3,3 +3,7 @@
 /bin
 /node_modules
 /.vs
+/dist
+/downloads
+/pkg-cache
+deno.lock
